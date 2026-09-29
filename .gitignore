@@ -17,3 +17,7 @@ runs/
 *.bmp
 *.tiff
 *.webp
+
+# python cache
+__pycache__/
+*.pyc
