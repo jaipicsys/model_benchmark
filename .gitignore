@@ -1,0 +1,19 @@
+# run outputs (segments, embeddings, reports, finetuned models)
+runs/
+
+# videos
+*.mkv
+*.mp4
+*.webm
+*.avi
+*.mov
+*.m4v
+
+# images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
