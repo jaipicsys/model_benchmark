@@ -18,6 +18,10 @@ runs/
 *.tiff
 *.webp
 
+# spreadsheets
+*.ods
+*.xlsx
+
 # python cache
 __pycache__/
 *.pyc
