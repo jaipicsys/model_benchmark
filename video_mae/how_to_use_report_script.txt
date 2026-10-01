@@ -1,0 +1,1 @@
+python3 make_test_report.py     --videomae_dir runs/roi_v4/videomae_finetuned/best_model     --individual_dir videos/     --continuous_dir caa_20cycles/     --gt cycle20GT.ods     --template temporal_test_template.xlsx     --window_len 2.0 --stride 1.0 --fps 15 --num_frames 16     --min_segment_duration 2.5 --confidence_threshold 0.7  --no_cache
