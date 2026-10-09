@@ -752,6 +752,94 @@ std::optional<double> segment_confidence(const std::vector<WindowTime>& wt, cons
     return n ? sum / n : all / conf.size();
 }
 
+// ----------------------------------------------------------------------------- Step-2 post-processing (README section 6)
+static std::string det_dump(const std::vector<Detected>& v) {
+    std::string o;
+    for (auto& d : v)
+        o += fmt("      %-12s %7.2f - %7.2f  (%.2fs)  conf=%.3f\n", d.label.c_str(), d.start, d.end, d.end - d.start,
+                 d.conf ? *d.conf : -1.0);
+    return o.empty() ? "      (none)\n" : o;
+}
+
+std::vector<Detected> postprocess_segments(const std::vector<WindowTime>& wt, const std::vector<double>& conf,
+                                           const std::vector<Segment>& segs, const PostCfg& cfg, PostDebug* dbg) {
+    PostDebug local;
+    PostDebug& D = dbg ? *dbg : local;
+    D = PostDebug{};
+
+    // everything before filtering (kept for debug / results.json)
+    for (auto& s : segs) D.unfiltered.push_back({s.label, s.start_sec, s.end_sec, segment_confidence(wt, conf, s)});
+
+    // step 2 (tail): drop "uncertain" segments; step 3: segment confidence over ALL windows
+    std::vector<Detected> cur;
+    for (auto& d : D.unfiltered) if (d.label != UNCERTAIN) cur.push_back(d);
+    D.after_drop_unc = cur;
+
+    // step 4: merge overlapping same-label segments (end = max, conf = MAX)
+    if (cfg.do_merge && !cur.empty()) {
+        std::stable_sort(cur.begin(), cur.end(), [](const Detected& a, const Detected& b) { return a.start < b.start; });
+        std::vector<Detected> merged;
+        for (auto& d : cur) {
+            if (!merged.empty() && merged.back().label == d.label && d.start <= merged.back().end) {
+                Detected& m = merged.back();
+                m.end = std::max(m.end, d.end);
+                m.conf = std::max(m.conf.value_or(0.0), d.conf.value_or(0.0));
+            } else merged.push_back(d);
+        }
+        cur = merged;
+    }
+    D.after_merge = cur;
+
+    // step 5: drop low-confidence segments
+    if (cfg.do_conf_filter) {
+        std::vector<Detected> keep;
+        for (auto& d : cur) if (d.conf.value_or(0.0) >= cfg.seg_conf_thr) keep.push_back(d);
+        cur = keep;
+    }
+    D.after_conf = cur;
+
+    // step 6: step-order filter (DP, maximise sum of conf*duration over order-non-decreasing chains)
+    if (cfg.do_order_filter && !cur.empty()) {
+        auto order_idx = [&](const std::string& l) {
+            auto it = std::find(cfg.order.begin(), cfg.order.end(), l);
+            return it == cfg.order.end() ? -1 : (int)(it - cfg.order.begin());
+        };
+        std::vector<Detected> cand;
+        for (auto& d : cur) (order_idx(d.label) >= 0 ? cand : D.dropped_unknown).push_back(d);
+        std::stable_sort(cand.begin(), cand.end(), [](const Detected& a, const Detected& b) {
+            return a.start != b.start ? a.start < b.start : a.end < b.end;
+        });
+        const int n = (int)cand.size();
+        std::vector<double> w(n), best(n);
+        std::vector<int> prev(n, -1), oi(n);
+        for (int i = 0; i < n; ++i) {
+            w[i] = cand[i].conf.value_or(0.0) * (cand[i].end - cand[i].start);
+            oi[i] = order_idx(cand[i].label);
+        }
+        const double EPS = 1e-12;
+        for (int i = 0; i < n; ++i) {
+            int bj = -1;
+            double bv = 0.0;  // max(0, best[j])
+            for (int j = 0; j < i; ++j) {
+                if (oi[j] > oi[i]) continue;
+                if (best[j] > bv + EPS || (bj >= 0 && std::fabs(best[j] - bv) <= EPS && best[j] > 0)) { bv = best[j]; bj = j; }  // tie -> later j
+            }
+            best[i] = w[i] + bv;
+            prev[i] = bj;
+        }
+        std::vector<Detected> chain;
+        if (n > 0) {
+            int e = 0;
+            for (int i = 1; i < n; ++i) if (best[i] >= best[e] - EPS) e = i;  // tie -> later i
+            for (int i = e; i >= 0; i = prev[i]) chain.push_back(cand[i]);
+            std::reverse(chain.begin(), chain.end());
+        }
+        cur = chain;
+    }
+    D.final_ = cur;
+    return cur;
+}
+
 ClipPred clip_prediction(const std::vector<WindowTime>& wt, const std::vector<std::vector<double>>& pc,
                          const std::vector<std::string>& uniq, const std::vector<Segment>& segs,
                          const std::vector<double>& conf, const Args& a, const std::string* true_label) {
@@ -1069,7 +1157,9 @@ Args parse_args(int argc, char** argv) {
             "  [--min_segment_duration S] [--confidence_threshold P] [--roi x,y,w,h] [--runs_dir DIR]\n"
             "  [--out_dir DIR] [--out_name NAME] [--clip_method any_detected|dominant_segment|mean_prob]\n"
             "  [--min_overlap S] [--keep_uncertain] [--merge_step6] [--tester NAME] [--test_date D]\n"
-            "  [--no_cache] [--cpu]   (CUDA is on by default)\n",
+            "  [--no_cache] [--cpu]   (CUDA is on by default)\n"
+            "  post-processing (Step 2): [--no_postproc] [--post_seg_conf P] [--post_no_merge] [--post_no_conf]\n"
+            "  [--post_no_order] [--post_order a,b,c,...] [--post_debug]\n",
             argv[0]);
     };
     for (int i = 1; i < argc; ++i) {
@@ -1113,6 +1203,18 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--tester") a.tester = val();
         else if (k == "--test_date") a.test_date = val();
         else if (k == "--no_cache") a.no_cache = true;
+        else if (k == "--no_postproc") a.post.enable = false;
+        else if (k == "--post_seg_conf") a.post.seg_conf_thr = std::stod(val());
+        else if (k == "--post_no_merge") a.post.do_merge = false;
+        else if (k == "--post_no_conf") a.post.do_conf_filter = false;
+        else if (k == "--post_no_order") a.post.do_order_filter = false;
+        else if (k == "--post_debug") a.post.debug = true;
+        else if (k == "--post_order") {
+            a.post.order.clear();
+            std::stringstream ss(val());
+            std::string p;
+            while (std::getline(ss, p, ',')) if (!trim(p).empty()) a.post.order.push_back(trim(p));
+        }
         else if (k == "--cuda") a.use_cuda = true;
         else if (k == "--cpu") a.use_cuda = false;
         else { usage(); throw std::runtime_error("unknown argument: " + k); }
@@ -1260,12 +1362,33 @@ int run_report(const Args& a) {
             int cyc = std::stoi(m[1].str());
             auto wp = engine.windows_and_probs(vp);
             auto pc = collapse_probs(wp.probs, col);
-            auto sr = windows_to_segments(wp.windows, pc, uniq, a);
-            std::vector<Detected> det_all;
-            for (auto& s : sr.segs) det_all.push_back({s.label, s.start_sec, s.end_sec, segment_confidence(wp.windows, sr.conf, s)});
+            Args a2 = a;  // Step 2 uses the post-processing window threshold unless --confidence_threshold was given
+            if (a.post.enable && !a.confidence_threshold) a2.confidence_threshold = a.post.window_conf_thr;
+            auto sr = windows_to_segments(wp.windows, pc, uniq, a2);
             std::vector<Detected> det;
-            for (auto& d : det_all) if (a.keep_uncertain || d.label != UNCERTAIN) det.push_back(d);
-            int n_unc = (int)(det_all.size() - det.size());
+            PostDebug pdbg;
+            int n_unc = 0;
+            for (auto& s : sr.segs) n_unc += s.label == UNCERTAIN;
+            if (a.post.enable) {
+                det = postprocess_segments(wp.windows, sr.conf, sr.segs, a.post, &pdbg);
+                if (a.keep_uncertain) {  // uncertain segments are dropped by step 2 of the README; nothing to re-add
+                    std::printf("  [note] --keep_uncertain is ignored while post-processing is enabled\n");
+                }
+                if (a.post.debug) {
+                    std::printf("  --- cycle %d post-processing ---\n    unfiltered (%zu):\n%s    after drop uncertain (%zu)\n"
+                                "    after merge (%zu)\n    after conf>=%.2f (%zu)\n    final (%zu):\n%s",
+                                cyc, pdbg.unfiltered.size(), det_dump(pdbg.unfiltered).c_str(), pdbg.after_drop_unc.size(),
+                                pdbg.after_merge.size(), a.post.seg_conf_thr, pdbg.after_conf.size(), pdbg.final_.size(),
+                                det_dump(pdbg.final_).c_str());
+                    if (!pdbg.dropped_unknown.empty())
+                        std::printf("    dropped (label not in order list):\n%s", det_dump(pdbg.dropped_unknown).c_str());
+                }
+            } else {
+                std::vector<Detected> det_all;
+                for (auto& s : sr.segs) det_all.push_back({s.label, s.start_sec, s.end_sec, segment_confidence(wp.windows, sr.conf, s)});
+                for (auto& d : det_all) if (a.keep_uncertain || d.label != UNCERTAIN) det.push_back(d);
+                n_unc = (int)(det_all.size() - det.size());
+            }
             const auto& g = gtr.gt[cyc];
             if ((int)det.size() > MAX_ROWS) trunc.emplace_back(cyc, (int)det.size());
             std::vector<Detected> det_cap(det.begin(), det.begin() + std::min<size_t>(det.size(), MAX_ROWS));
@@ -1289,7 +1412,11 @@ int run_report(const Args& a) {
             int fp = 0;
             for (int i = 0; i < (int)det_cap.size(); ++i) if (!used.count(i + 1)) ++fp;
 
-            json jg = json::array(), jd = json::array(), jm = json::array();
+            json jg = json::array(), jd = json::array(), jm = json::array(), junf = json::array();
+            if (a.post.enable)  // raw segments before post-processing (the order filter can hide skipped/repeated steps)
+                for (auto& d : pdbg.unfiltered)
+                    junf.push_back({{"label", d.label}, {"start", d.start}, {"end", d.end},
+                                    {"conf", d.conf ? json(*d.conf) : json(nullptr)}});
             for (auto& s : g) jg.push_back({{"label", s.label}, {"start", s.start}, {"end", s.end}});
             for (auto& d : det) {
                 json o = {{"label", d.label}, {"start", d.start}, {"end", d.end}};
@@ -1299,7 +1426,8 @@ int run_report(const Args& a) {
             for (auto& mm : matches) jm.push_back(mm ? json(*mm) : json(nullptr));
             results["continuous"].push_back({{"cycle", cyc}, {"video", vp}, {"gt", jg}, {"detected", jd}, {"matches", jm},
                                              {"ok", ok}, {"missed", miss}, {"wrong_label", wrong}, {"false_positives", fp},
-                                             {"uncertain_segments_dropped", n_unc}});
+                                             {"uncertain_segments_dropped", n_unc},
+                                             {"unfiltered", junf}});
             t_ok += ok; t_miss += miss; t_wrong += wrong; t_fp += fp; t_gt += (long)g.size();
             std::printf("  cycle %2d: GT=%zu OK=%d missed=%d wrong=%d FP=%d (detected %zu, dropped %d uncertain)\n", cyc, g.size(),
                         ok, miss, wrong, fp, det.size(), n_unc);
@@ -1315,6 +1443,11 @@ int run_report(const Args& a) {
         build_dashboard_step2(wb, cyc_sheets);
         notes.push_back(fmt("Step2: %zu cycles, one sheet each; 'uncertain' segments %s from Section B; match needs >= %s s overlap.",
                             cyc_sheets.size(), a.keep_uncertain ? "kept" : "excluded", pyfloat(a.min_overlap).c_str()));
+        if (a.post.enable)
+            notes.push_back(fmt("Post-processing ON: window_conf>=%s, merge=%d, seg_conf>=%s (%d), order_filter=%d.",
+                                pyfloat(a.confidence_threshold.value_or(a.post.window_conf_thr)).c_str(), (int)a.post.do_merge,
+                                pyfloat(a.post.seg_conf_thr).c_str(), (int)a.post.do_conf_filter, (int)a.post.do_order_filter));
+        else notes.push_back("Post-processing OFF (raw detections).");
         if (!trunc.empty()) notes.push_back(fmt("TRUNCATED detections (>%d) in %zu cycle(s)", MAX_ROWS, trunc.size()));
     }
 
@@ -1334,6 +1467,7 @@ int run_report(const Args& a) {
     set_n(ri, "B12", a.stride);
     set_n(ri, "B13", a.num_frames);
     if (a.confidence_threshold) set_n(ri, "B14", *a.confidence_threshold);
+    else if (a.post.enable && !a.continuous_dir.empty()) set_n(ri, "B14", a.post.window_conf_thr);
     else ri.cell("B14").clear_value();
     set_n(ri, "B15", a.min_segment_duration);
     std::string info = "fps=" + pyfloat(a.fps) + ". Label rename: " + rename_repr(rename) + ".";
