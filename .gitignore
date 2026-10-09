@@ -1,5 +1,13 @@
 # run outputs (segments, embeddings, reports, finetuned models)
 runs/
+video_mae/export_onnx.py
+video_mae/make_test_report
+video_mae/make_test_report_dbg
+video_mae/onnxruntime-linux-x64-1.23.2/
+video_mae/onnxruntime-linux-x64-gpu-1.19.2/
+video_mae/venv/
+video_mae/venv_export/
+
 
 # videos
 *.mkv
