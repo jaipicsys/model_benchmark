@@ -13,6 +13,15 @@ It uses the SAME functions/settings as detect_segments.py (extract_session_embed
 labels_to_segments, apply_min_duration_filter, confidence threshold), but calls them directly
 so it can also record per-clip confidence.
 
+STEP-2 POST-PROCESSING (same as the C++ make_test_report; every switch is a flag):
+  1. per-window argmax, confidence < window threshold            -> "uncertain"
+  2. labels_to_segments + min-duration filter, drop "uncertain" segments
+  3. segment confidence = mean confidence of ALL windows whose midpoint lies inside the segment
+  4. merge overlapping same-label segments (end = max, conf = MAX)
+  5. drop segments with confidence < --post_seg_conf
+  6. step-order filter: DP keeping the best order-non-decreasing chain (max sum of conf*duration)
+  --no_postproc turns all of this off (old raw behaviour).
+
 USAGE (from the video_mae folder, same env you use for detect_segments.py):
 
     python3 make_test_report.py \
@@ -39,6 +48,8 @@ UNCERTAIN = "uncertain"
 MERGE_STEP6_RENAME = {"step6": "step6.5"}   # only used with --merge_step6 (default: step6 and step6.5 are separate classes)
 GT_MERGE_GAP = 3.0                      # GT ranges with the same label closer than this get merged
 MAX_ROWS = 40                           # template capacity for GT rows and detected rows per sheet
+DEFAULT_ORDER = ["start_step1", "start_step2", "step4", "step5", "step6", "step6.5",
+                 "step7", "step8", "step9", "step10", "stop_step1", "stop_step2"]
 
 
 # ----------------------------------------------------------------------------- labels
@@ -173,17 +184,18 @@ def collapse_matrix(class_names_raw, rename):
     return uniq, M
 
 
-def windows_to_segments(window_times, probs_c, uniq, a, be):
+def windows_to_segments(window_times, probs_c, uniq, thr, min_seg_dur, be):
+    """thr = window confidence threshold (None = no thresholding)."""
     if len(window_times) == 0:
         return [], [], np.array([])
     starts = [w[0] for w in window_times]
     ends = [w[1] for w in window_times]
     idx, conf = probs_c.argmax(axis=1), probs_c.max(axis=1)
     labels = [uniq[i] for i in idx]
-    if a.confidence_threshold is not None:
-        labels = [l if c >= a.confidence_threshold else UNCERTAIN for l, c in zip(labels, conf)]
+    if thr is not None:
+        labels = [l if c >= thr else UNCERTAIN for l, c in zip(labels, conf)]
     raw = be.labels_to_segments(starts, ends, labels)
-    segs = be.apply_min_duration_filter(raw, a.min_segment_duration)
+    segs = be.apply_min_duration_filter(raw, min_seg_dur)
     return segs, labels, conf
 
 
@@ -236,6 +248,92 @@ def segment_confidence(window_times, conf, seg):
     mids = np.array([(w[0] + w[1]) / 2 for w in window_times])
     m = (mids >= seg["start_sec"]) & (mids <= seg["end_sec"])
     return float(conf[m].mean()) if m.any() else float(conf.mean())
+
+
+# ----------------------------------------------------------------------------- Step-2 post-processing
+def det_dump(dets):
+    if not dets:
+        return "      (none)\n"
+    return "".join(
+        f"      {d['label']:<12} {d['start']:7.2f} - {d['end']:7.2f}  ({d['end'] - d['start']:.2f}s)  "
+        f"conf={d['conf'] if d['conf'] is not None else -1.0:.3f}\n" for d in dets)
+
+
+def postprocess_segments(window_times, conf, segs, a):
+    """Steps 2-6 of the post-processing. `segs` = output of windows_to_segments (min-duration filter already
+    applied, "uncertain" segments still present).  Returns (final_detections, debug_dict).
+    Each detection = {"label", "start", "end", "conf"}.
+
+    Order-filter tie-breaking (identical to the C++ version):
+      * segments sorted by (start, end, original index)
+      * predecessor j for i: j<i with order(label j) <= order(label i) and the highest best[j];
+        equal best[j] (|diff| < 1e-12) -> the LATER j wins
+      * chain end: highest best[i]; equal -> the LATER i wins
+      * labels not in --post_order cannot be placed in the order and are dropped.
+    """
+    D = {"unfiltered": [], "after_drop_unc": [], "after_merge": [], "after_conf": [], "final": [], "dropped_unknown": []}
+
+    D["unfiltered"] = [{"label": s["label"], "start": s["start_sec"], "end": s["end_sec"],
+                        "conf": segment_confidence(window_times, conf, s)} for s in segs]
+
+    # step 2 (tail) + 3: drop "uncertain" segments (segment confidence was computed over ALL windows above)
+    cur = [dict(d) for d in D["unfiltered"] if d["label"] != UNCERTAIN]
+    D["after_drop_unc"] = [dict(d) for d in cur]
+
+    # step 4: merge overlapping same-label segments (end = max, conf = MAX)
+    if a.post_merge and cur:
+        cur.sort(key=lambda d: d["start"])
+        merged = []
+        for d in cur:
+            if merged and merged[-1]["label"] == d["label"] and d["start"] <= merged[-1]["end"]:
+                m = merged[-1]
+                m["end"] = max(m["end"], d["end"])
+                m["conf"] = max(m["conf"] or 0.0, d["conf"] or 0.0)
+            else:
+                merged.append(dict(d))
+        cur = merged
+    D["after_merge"] = [dict(d) for d in cur]
+
+    # step 5: drop low-confidence segments
+    if a.post_conf_filter:
+        cur = [d for d in cur if (d["conf"] or 0.0) >= a.post_seg_conf]
+    D["after_conf"] = [dict(d) for d in cur]
+
+    # step 6: step-order filter (DP, maximise sum of conf*duration over order-non-decreasing chains)
+    if a.post_order_filter and cur:
+        order = a.post_order
+        oidx = lambda l: order.index(l) if l in order else -1
+        cand = []
+        for d in cur:
+            (cand if oidx(d["label"]) >= 0 else D["dropped_unknown"]).append(d)
+        cand.sort(key=lambda d: (d["start"], d["end"]))   # stable -> original index breaks remaining ties
+        n = len(cand)
+        w = [(d["conf"] or 0.0) * (d["end"] - d["start"]) for d in cand]
+        oi = [oidx(d["label"]) for d in cand]
+        best, prev, EPS = [0.0] * n, [-1] * n, 1e-12
+        for i in range(n):
+            bj, bv = -1, 0.0   # bv = max(0, best[j])
+            for j in range(i):
+                if oi[j] > oi[i]:
+                    continue
+                if best[j] > bv + EPS or (bj >= 0 and abs(best[j] - bv) <= EPS and best[j] > 0):
+                    bv, bj = best[j], j   # tie -> later j
+            best[i] = w[i] + bv
+            prev[i] = bj
+        chain = []
+        if n:
+            e = 0
+            for i in range(1, n):
+                if best[i] >= best[e] - EPS:   # tie -> later i
+                    e = i
+            i = e
+            while i >= 0:
+                chain.append(cand[i])
+                i = prev[i]
+            chain.reverse()
+        cur = chain
+    D["final"] = cur
+    return cur, D
 
 
 # ----------------------------------------------------------------------------- matching (Section C)
@@ -354,7 +452,7 @@ def fill_cycle_sheet(wb, proto, sheet_name, title, gt_segs, det_segs, matches, d
     for i, m in enumerate(matches[:MAX_ROWS]):
         ws[f"E{96 + i}"] = m
 
-    # --- NEW: confidence column next to Section B (col G), and per-GT confidence in Section C (col K)
+    # --- confidence column next to Section B (col G), and per-GT confidence in Section C (col K)
     ws["G51"]._style = copy(ws["F51"]._style)
     ws["G51"] = "Confidence"
     for i in range(MAX_ROWS):
@@ -388,7 +486,9 @@ def parse_args():
     p.add_argument("--fps", type=float, default=15.0)
     p.add_argument("--num_frames", type=int, default=16)
     p.add_argument("--min_segment_duration", type=float, default=2.5)
-    p.add_argument("--confidence_threshold", type=float, default=None)
+    p.add_argument("--confidence_threshold", type=float, default=None,
+                   help="window confidence threshold. Step 1: used as given (None = off). "
+                        "Step 2: if omitted and post-processing is on, --post_window_conf is used")
     p.add_argument("--roi", default=None)
     p.add_argument("--runs_dir", default="runs")
     p.add_argument("--out_dir", default=None)
@@ -399,13 +499,31 @@ def parse_args():
     p.add_argument("--min_overlap", type=float, default=1.0,
                    help="min seconds of overlap for a detected segment to be matched to a GT step (Step 2)")
     p.add_argument("--keep_uncertain", action="store_true",
-                   help="list 'uncertain' segments in Section B too (they then count as false positives)")
+                   help="(post-processing OFF only) list 'uncertain' segments in Section B too (they count as false positives)")
     p.add_argument("--merge_step6", action="store_true",
                    help="merge step6 into step6.5 (default: they are separate tests)")
     p.add_argument("--tester", default=None)
     p.add_argument("--test_date", default=None)
     p.add_argument("--no_cache", action="store_true")
-    return p.parse_args()
+
+    g = p.add_argument_group("Step-2 post-processing")
+    g.add_argument("--no_postproc", action="store_true", help="turn the whole post-processing off (raw detections)")
+    g.add_argument("--post_window_conf", type=float, default=0.7,
+                   help="window threshold used in Step 2 when --confidence_threshold is not given (default 0.7)")
+    g.add_argument("--post_seg_conf", type=float, default=0.7, help="drop segments with confidence below this (default 0.7)")
+    g.add_argument("--post_no_merge", action="store_true", help="skip merging of overlapping same-label segments")
+    g.add_argument("--post_no_conf", action="store_true", help="skip the segment-confidence filter")
+    g.add_argument("--post_no_order", action="store_true", help="skip the step-order filter")
+    g.add_argument("--post_order", default=",".join(DEFAULT_ORDER),
+                   help="comma separated step order used by the order filter")
+    g.add_argument("--post_debug", action="store_true", help="print every post-processing stage per cycle")
+    a = p.parse_args()
+    a.post_enable = not a.no_postproc
+    a.post_merge = not a.post_no_merge
+    a.post_conf_filter = not a.post_no_conf
+    a.post_order_filter = not a.post_no_order
+    a.post_order = [x.strip() for x in a.post_order.split(",") if x.strip()]
+    return a
 
 
 def load_backend():
@@ -460,7 +578,7 @@ def main():
                 print(f"  [WARNING] true label '{true}' ({os.path.basename(vp)}) is not one of the model's labels {uniq}")
             wt, probs = engine.windows_and_probs(vp)
             pc = np.asarray(probs) @ M if len(wt) else np.zeros((0, len(uniq)))
-            segs, _labels, conf = windows_to_segments(wt, pc, uniq, a, be)
+            segs, _labels, conf = windows_to_segments(wt, pc, uniq, a.confidence_threshold, a.min_segment_duration, be)
             lab, c, note = clip_prediction(wt, pc, uniq, segs, conf, a, true)
             clips.append({"file": os.path.basename(vp), "true": true, "pred": lab, "conf": c, "note": note})
             print(f"  {os.path.basename(vp):34s} true={true:11s} pred={lab:11s} conf={c:.3f} {'' if lab == true else '  <-- WRONG'}")
@@ -480,8 +598,14 @@ def main():
         notes_for_runinfo.append(f"Step1: {len(clips)} clips, method={a.clip_method}, {n_unc} predicted 'uncertain'.")
 
     # ---------------- Step 2
+    step2_thr = a.confidence_threshold
     if a.continuous_dir:
         print("=== STEP 2: continuous videos ===")
+        # Step 2 uses the post-processing window threshold unless --confidence_threshold was given
+        if a.post_enable and step2_thr is None:
+            step2_thr = a.post_window_conf
+        if a.post_enable and a.keep_uncertain:
+            print("  [note] --keep_uncertain is ignored while post-processing is enabled")
         gt, gt_labels = load_gt(a.gt, rename)
         bad = sorted(set(l for segs in gt.values() for l in [s["label"] for s in segs]) - set(uniq))
         if bad:
@@ -498,30 +622,48 @@ def main():
             cyc = int(m.group(1))
             wt, probs = engine.windows_and_probs(vp)
             pc = np.asarray(probs) @ M
-            segs, _l, _c = windows_to_segments(wt, pc, uniq, a, be)
-            det_all = [{"label": s["label"], "start": s["start_sec"], "end": s["end_sec"],
-                        "conf": segment_confidence(wt, _c, s)} for s in segs]
-            det = det_all if a.keep_uncertain else [d for d in det_all if d["label"] != UNCERTAIN]
-            n_unc = len(det_all) - len(det)
+            segs, _l, wconf = windows_to_segments(wt, pc, uniq, step2_thr, a.min_segment_duration, be)
+            n_unc = sum(1 for s in segs if s["label"] == UNCERTAIN)
+            D = None
+            if a.post_enable:
+                det, D = postprocess_segments(wt, wconf, segs, a)
+                if a.post_debug:
+                    print(f"  --- cycle {cyc} post-processing ---")
+                    print(f"    unfiltered ({len(D['unfiltered'])}):\n{det_dump(D['unfiltered'])}"
+                          f"    after drop uncertain ({len(D['after_drop_unc'])})\n"
+                          f"    after merge ({len(D['after_merge'])})\n"
+                          f"    after conf>={a.post_seg_conf:.2f} ({len(D['after_conf'])})\n"
+                          f"    final ({len(D['final'])}):\n{det_dump(D['final'])}", end="")
+                    if D["dropped_unknown"]:
+                        print(f"    dropped (label not in order list):\n{det_dump(D['dropped_unknown'])}", end="")
+            else:
+                det_all = [{"label": s["label"], "start": s["start_sec"], "end": s["end_sec"],
+                            "conf": segment_confidence(wt, wconf, s)} for s in segs]
+                det = det_all if a.keep_uncertain else [d for d in det_all if d["label"] != UNCERTAIN]
+                n_unc = len(det_all) - len(det)
             g = gt[cyc]
             if len(det) > MAX_ROWS:
                 trunc.append((cyc, len(det)))
-            matches = match_gt_to_det(g, det[:MAX_ROWS], a.min_overlap)
+            det_cap = det[:MAX_ROWS]
+            matches = match_gt_to_det(g, det_cap, a.min_overlap)
 
             sheet = f"Step2_cycle{cyc:02d}"
             fill_cycle_sheet(wb, proto, sheet,
-                             f"Step 2 -- Continuous Video: cycle {cyc} ({os.path.basename(vp)})", g, det, matches, {},
-                             det_confs=[d["conf"] for d in det[:MAX_ROWS]])
+                             f"Step 2 -- Continuous Video: cycle {cyc} ({os.path.basename(vp)})", g, det_cap, matches, {},
+                             det_confs=[d["conf"] for d in det_cap])
             cyc_sheets.append((cyc, sheet))
 
-            ok = sum(1 for gg, mm in zip(g, matches) if mm and det[mm - 1]["label"] == gg["label"])
+            ok = sum(1 for gg, mm in zip(g, matches) if mm and det_cap[mm - 1]["label"] == gg["label"])
             miss = sum(1 for mm in matches if mm is None)
             wrong = len(g) - ok - miss
             used = {mm for mm in matches if mm}
-            fp = sum(1 for i in range(min(len(det), MAX_ROWS)) if (i + 1) not in used)
-            results["continuous"].append({"cycle": cyc, "video": vp, "gt": g, "detected": det, "matches": matches,
-                                          "ok": ok, "missed": miss, "wrong_label": wrong, "false_positives": fp,
-                                          "uncertain_segments_dropped": n_unc})
+            fp = sum(1 for i in range(len(det_cap)) if (i + 1) not in used)
+            rec = {"cycle": cyc, "video": vp, "gt": g, "detected": det, "matches": matches,
+                   "ok": ok, "missed": miss, "wrong_label": wrong, "false_positives": fp,
+                   "uncertain_segments_dropped": n_unc}
+            if D is not None:   # raw segments before post-processing (the order filter can hide skipped/repeated steps)
+                rec["unfiltered"] = D["unfiltered"]
+            results["continuous"].append(rec)
             print(f"  cycle {cyc:2d}: GT={len(g)} OK={ok} missed={miss} wrong={wrong} FP={fp} "
                   f"(detected {len(det)}, dropped {n_unc} uncertain)")
         del wb["Step2_Continuous_Video"]
@@ -533,7 +675,14 @@ def main():
               f"missed={tot['missed']}, wrong label={tot['wrong_label']}, false positives={tot['false_positives']}\n")
         build_dashboard_step2(wb, cyc_sheets)
         notes_for_runinfo.append(f"Step2: {len(cyc_sheets)} cycles, one sheet each; 'uncertain' segments "
-                                 f"{'kept' if a.keep_uncertain else 'excluded'} from Section B; match needs >= {a.min_overlap}s overlap.")
+                                 f"{'kept' if (a.keep_uncertain and not a.post_enable) else 'excluded'} from Section B; "
+                                 f"match needs >= {a.min_overlap}s overlap.")
+        if a.post_enable:
+            notes_for_runinfo.append(f"Post-processing ON: window_conf>={step2_thr}, merge={int(a.post_merge)}, "
+                                     f"seg_conf>={a.post_seg_conf} ({int(a.post_conf_filter)}), "
+                                     f"order_filter={int(a.post_order_filter)}.")
+        else:
+            notes_for_runinfo.append("Post-processing OFF (raw detections).")
         if trunc:
             notes_for_runinfo.append(f"TRUNCATED detections (>{MAX_ROWS}) in cycles {trunc}")
 
@@ -547,7 +696,12 @@ def main():
     ri["B9"] = fingerprint
     ri["B10"] = ",".join(str(int(v)) if float(v).is_integer() else str(v) for v in roi) if roi else "none"
     ri["B11"], ri["B12"], ri["B13"] = a.window_len, a.stride, a.num_frames
-    ri["B14"] = a.confidence_threshold
+    if a.confidence_threshold is not None:
+        ri["B14"] = a.confidence_threshold
+    elif a.post_enable and a.continuous_dir:
+        ri["B14"] = a.post_window_conf
+    else:
+        ri["B14"] = None
     ri["B15"] = a.min_segment_duration
     ri["B16"] = (f"fps={a.fps}. Label rename: {rename or 'none'}. " + " ".join(notes_for_runinfo))
 

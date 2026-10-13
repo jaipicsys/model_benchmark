@@ -1,1 +1,50 @@
-python3 make_test_report.py     --videomae_dir runs/roi_v4/videomae_finetuned/best_model     --individual_dir videos/     --continuous_dir caa_20cycles/     --gt cycle20GT.ods     --template temporal_test_template.xlsx     --window_len 2.0 --stride 1.0 --fps 15 --num_frames 16     --min_segment_duration 2.5 --confidence_threshold 0.7  --no_cache
+
+1) How to use make_test_reportv2.py
+
+python3 make_test_reportv2.py     --videomae_dir runs/roi_v5/videomae_finetuned/best_model     --individual_dir videos/     --continuous_dir caa_20cycles/     --gt cycle20GT.ods     --template temporal_test_template.xlsx     --window_len 6.5 --stride 1.0 --fps 15 --num_frames 16     --min_segment_duration 2.5 --confidence_threshold 0.7  --no_cache
+
+
+2) How to use make_test_reportv2_confusion_matrix.py
+
+python3 make_test_reportv2_confusion_matrix.py     --videomae_dir runs/roi_v5/videomae_finetuned/best_model     --individual_dir videos/     --continuous_dir caa_20cycles/     --gt cycle20GT.ods     --template temporal_test_template.xlsx     --window_len 6.5     --stride 1.0     --fps 15     --num_frames 16     --min_segment_duration 2.5     --confidence_threshold 0.7     --clip_method dominant_segment
+
+
+3) How to compile and run make_test_reportC.cpp
+
+export ORT="$HOME/work/model_benchmark/video_mae/onnxruntime-linux-x64-gpu-1.19.2"
+
+g++ -std=c++17 -O2 make_test_reportC.cpp -o make_test_reportC \
+    $(pkg-config --cflags opencv4) \
+    -I"$ORT/include" \
+    -L"$ORT/lib" \
+    -Wl,-rpath,"$ORT/lib" \
+    $(pkg-config --libs opencv4) \
+    -lonnxruntime -lxlnt -lzip -lpugixml
+
+./make_test_reportC \
+    --videomae_dir runs/roi_v5/videomae_finetuned/best_model \
+    --onnx_path runs/roi_v5/videomae_finetuned/best_model/model_mha.onnx \
+    --individual_dir videos/ \
+    --continuous_dir caa_20cycles/ \
+    --gt cycle20GT.ods \
+    --template temporal_test_template.xlsx \
+    --window_len 6.5 --stride 1.0 --fps 15 --num_frames 16 \
+    --min_segment_duration 2.5 --confidence_threshold 0.7 --no_cache
+
+
+4) How to compile and run make_test_reportC_rtsp.cpp
+
+export ORT="$HOME/work/model_benchmark/video_mae/onnxruntime-linux-x64-gpu-1.19.2"
+
+g++ -std=c++17 -O2 make_test_reportC_rtsp.cpp -o make_test_reportC_rtsp \
+    $(pkg-config --cflags opencv4) \
+    -I"$ORT/include" \
+    -L"$ORT/lib" \
+    -Wl,-rpath,"$ORT/lib" \
+    $(pkg-config --libs opencv4) \
+    -lonnxruntime -lxlnt -lzip -lpugixml
+
+./make_test_reportC_rtsp --videomae_dir runs/roi_v5/videomae_finetuned/best_model \
+       --onnx_path runs/roi_v5/videomae_finetuned/best_model/model_mha.onnx \
+       --rtsp rtsp://192.168.2.170:8554/cam1 \
+       --window_len 6.5 --stride 1.0 --fps 15 --num_frames 16 --min_segment_duration 2.5 --events_log events.jsonl
