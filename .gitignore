@@ -8,6 +8,7 @@ video_mae/onnxruntime-linux-x64-gpu-1.19.2/
 video_mae/venv/
 video_mae/venv_export/
 video_mae/make_test_report_rtsp
+video_mae/step_monitor
 
 
 # videos

@@ -480,16 +480,26 @@ VideoMAEModel::VideoMAEModel(const std::string& model_dir, const std::string& on
             for (int i = 0; i < 3; ++i) p_->stdv[i] = j["image_std"][i].get<float>();
     }
     p_->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    if (use_cuda) {
-        try {
-            OrtCUDAProviderOptions co{};
-            co.device_id = 0;
-            p_->opts.AppendExecutionProvider_CUDA(co);
-            p_->device = "cuda";
-        } catch (const Ort::Exception& e) {
-            std::fprintf(stderr, "[warn] CUDA provider unavailable (%s); falling back to CPU\n", e.what());
-        }
+   if (use_cuda) {
+    OrtCUDAProviderOptionsV2* cuda_opts = nullptr;
+    try {
+        const OrtApi& api = Ort::GetApi();
+        Ort::ThrowOnError(api.CreateCUDAProviderOptions(&cuda_opts));
+
+        const char* keys[]   = {"device_id", "cudnn_conv_algo_search", "cudnn_conv_use_max_workspace",
+                        "gpu_mem_limit", "arena_extend_strategy"};
+const char* values[] = {"0", "HEURISTIC", "0",
+                        "524288000", "kSameAsRequested"};   // 500 MiB cap
+Ort::ThrowOnError(api.UpdateCUDAProviderOptions(cuda_opts, keys, values, 5));
+        Ort::ThrowOnError(api.SessionOptionsAppendExecutionProvider_CUDA_V2(p_->opts, cuda_opts));
+        api.ReleaseCUDAProviderOptions(cuda_opts);
+        cuda_opts = nullptr;
+        p_->device = "cuda";
+    } catch (const Ort::Exception& e) {
+        if (cuda_opts) Ort::GetApi().ReleaseCUDAProviderOptions(cuda_opts);
+        std::fprintf(stderr, "[warn] CUDA provider unavailable (%s); falling back to CPU\n", e.what());
     }
+}
 #ifdef _WIN32
     std::wstring wp(onnx_path.begin(), onnx_path.end());
     p_->session = std::make_unique<Ort::Session>(p_->env, wp.c_str(), p_->opts);
