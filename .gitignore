@@ -7,6 +7,8 @@ video_mae/venv/
 video_mae/venv_export/
 video_mae/make_test_reportC
 video_mae/make_test_reportC_rtsp
+video_mae/make_test_reportCJ
+video_mae/make_test_report_long_video
 
 # videos
 *.mkv
@@ -28,6 +30,7 @@ video_mae/make_test_reportC_rtsp
 # spreadsheets
 *.ods
 *.xlsx
+*.csv
 
 # python cache
 __pycache__/

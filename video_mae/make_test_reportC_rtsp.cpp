@@ -4,6 +4,9 @@
 // the video-file testing and the Excel report generation are removed.  Frames are read from an RTSP stream,
 // windows are classified as they complete, and every step (start time, finish time, duration) is logged.
 //
+// Everything printed to the terminal (stdout/stderr) is also appended to a CSV file
+// (default: terminal_output.csv, columns: timestamp,stream,text; override with --terminal_csv FILE).
+//
 // Build example:
 //   g++ -std=c++17 -O2 make_test_report_live.cpp -o step_monitor $(pkg-config --cflags --libs opencv4) -lonnxruntime -pthread
 //
@@ -100,6 +103,66 @@ static std::string rename_repr(const RenameMap& r) {
     return s + "}";
 }
 
+// ============================================================================= terminal tee -> CSV
+// Everything printed to stdout/stderr is also appended to a CSV file (one row per printed line).
+static std::mutex g_csv_m;
+static std::ofstream g_csv;
+
+static std::string csv_quote(const std::string& s) {
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"') o += "\"\"";
+        else o += c;
+    }
+    return o + "\"";
+}
+
+void csv_open(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_csv_m);
+    std::error_code ec;
+    bool fresh = !fs::exists(path, ec) || fs::file_size(path, ec) == 0;
+    g_csv.open(path, std::ios::app);
+    if (g_csv && fresh) g_csv << "timestamp,stream,text\n";
+}
+
+static void csv_write(const char* stream, const std::string& text) {
+    std::lock_guard<std::mutex> lk(g_csv_m);
+    if (!g_csv.is_open()) return;
+    auto tp = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(tp);
+    int ms = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count() % 1000);
+    std::tm tmv;
+    localtime_r(&tt, &tmv);
+    char ts[40];
+    std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
+    std::string stamp = fmt("%s.%03d", ts, ms);
+    std::stringstream ss(text);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        g_csv << stamp << ',' << stream << ',' << csv_quote(line) << '\n';
+    }
+    g_csv.flush();
+}
+
+void tprint(FILE* f, const std::string& s) {
+    std::fputs(s.c_str(), f);
+    csv_write(f == stderr ? "stderr" : "stdout", s);
+}
+
+static void tprintf(const char* f, ...) __attribute__((format(printf, 1, 2)));
+static void tprintf(const char* f, ...) {
+    va_list ap, ap2;
+    va_start(ap, f);
+    va_copy(ap2, ap);
+    int n = std::vsnprintf(nullptr, 0, f, ap);
+    va_end(ap);
+    std::string s(n > 0 ? (size_t)n : 0, '\0');
+    if (n > 0) std::vsnprintf(&s[0], (size_t)n + 1, f, ap2);
+    va_end(ap2);
+    tprint(stdout, s);
+}
+
 // ============================================================================= labels
 static const std::regex STEP_RE(R"(^(?:(start|stop)_)?step_?(\d+(?:\.\d+)?)$)", std::regex::icase);
 
@@ -181,7 +244,7 @@ std::optional<Roi> resolve_roi(const std::string& model_dir, const std::string& 
         json j = json::parse(f);
         if (j.contains("roi") && j["roi"].is_array() && j["roi"].size() == 4) {
             Roi r{j["roi"][0].get<int>(), j["roi"][1].get<int>(), j["roi"][2].get<int>(), j["roi"][3].get<int>()};
-            std::printf("Auto-loaded ROI from %s: (%d, %d, %d, %d)\n", rp.string().c_str(), r.x, r.y, r.w, r.h);
+            tprintf("Auto-loaded ROI from %s: (%d, %d, %d, %d)\n", rp.string().c_str(), r.x, r.y, r.w, r.h);
             return r;
         }
     }
@@ -245,7 +308,7 @@ VideoMAEModel::VideoMAEModel(const std::string& model_dir, const std::string& on
             p_->device = "cuda";
         } catch (const Ort::Exception& e) {
             if (cuda_opts) Ort::GetApi().ReleaseCUDAProviderOptions(cuda_opts);
-            std::fprintf(stderr, "[warn] CUDA provider unavailable (%s); falling back to CPU\n", e.what());
+            tprint(stderr, fmt("[warn] CUDA provider unavailable (%s); falling back to CPU\n", e.what()));
         }
     }
 #ifdef _WIN32
@@ -509,7 +572,7 @@ static std::string stamp(double t) { return fmt("%s (t+%s)", wall_str(t).c_str()
 
 static void say(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_log_m);
-    std::printf("[%s] %s\n", wall_of(std::chrono::system_clock::now()).c_str(), msg.c_str());
+    tprint(stdout, "[" + wall_of(std::chrono::system_clock::now()) + "] " + msg + "\n");
     std::fflush(stdout);
 }
 
@@ -626,9 +689,9 @@ public:
             say(s);
             if (a_.post.enable) {
                 std::lock_guard<std::mutex> lk(g_log_m);
-                std::printf("    unfiltered (%zu):\n%s    after merge (%zu) | after conf (%zu) | final (%zu):\n%s", dbg.unfiltered.size(),
-                            det_dump(dbg.unfiltered).c_str(), dbg.after_merge.size(), dbg.after_conf.size(), dbg.final_.size(),
-                            det_dump(dbg.final_).c_str());
+                tprintf("    unfiltered (%zu):\n%s    after merge (%zu) | after conf (%zu) | final (%zu):\n%s", dbg.unfiltered.size(),
+                        det_dump(dbg.unfiltered).c_str(), dbg.after_merge.size(), dbg.after_conf.size(), dbg.final_.size(),
+                        det_dump(dbg.final_).c_str());
                 std::fflush(stdout);
             }
         }
@@ -773,12 +836,12 @@ private:
             std::lock_guard<std::mutex> lk(g_log_m);
             int n = 0;
             for (auto& d : fin)
-                std::printf("      %2d. %-12s %s -> %s  %6.1f s  conf %.2f\n", ++n, d.label.c_str(), wall_str(d.start).c_str(),
-                            wall_str(d.end).c_str(), d.end - d.start, d.conf.value_or(0.0));
+                tprintf("      %2d. %-12s %s -> %s  %6.1f s  conf %.2f\n", ++n, d.label.c_str(), wall_str(d.start).c_str(),
+                        wall_str(d.end).c_str(), d.end - d.start, d.conf.value_or(0.0));
             std::string missing;
             for (auto& o : a_.post.order)
                 if (std::none_of(fin.begin(), fin.end(), [&](const Detected& d) { return d.label == o; })) missing += (missing.empty() ? "" : ", ") + o;
-            if (!missing.empty()) std::printf("      not detected in this cycle: %s\n", missing.c_str());
+            if (!missing.empty()) tprintf("      not detected in this cycle: %s\n", missing.c_str());
             std::fflush(stdout);
         }
     }
@@ -836,18 +899,18 @@ int run_live(const Args& a) {
         for (size_t i = 0; i < v.size(); ++i) s += (i ? ", '" : "'") + v[i] + "'";
         return s + "]";
     };
-    std::printf("Model classes (%zu): %s\n", raw_names.size(), join(raw_names).c_str());
-    std::printf("Step labels    (%zu): %s   (rename map: %s)\n", uniq.size(), join(uniq).c_str(), rename_repr(rename).c_str());
-    std::printf("Step order: %s\n", join(a.post.order).c_str());
+    tprintf("Model classes (%zu): %s\n", raw_names.size(), join(raw_names).c_str());
+    tprintf("Step labels    (%zu): %s   (rename map: %s)\n", uniq.size(), join(uniq).c_str(), rename_repr(rename).c_str());
+    tprintf("Step order: %s\n", join(a.post.order).c_str());
     for (auto& o : a.post.order)
         if (std::find(uniq.begin(), uniq.end(), o) == uniq.end())
-            std::printf("  [WARNING] order label '%s' is not one of the model's labels\n", o.c_str());
-    std::printf("Window %.2fs / stride %.2fs / %d frames, min segment %.2fs, post-processing %s\n", a.window_len, a.stride, a.num_frames,
-                a.min_segment_duration, a.post.enable ? "ON" : "OFF");
+            tprintf("  [WARNING] order label '%s' is not one of the model's labels\n", o.c_str());
+    tprintf("Window %.2fs / stride %.2fs / %d frames, min segment %.2fs, post-processing %s\n", a.window_len, a.stride, a.num_frames,
+            a.min_segment_duration, a.post.enable ? "ON" : "OFF");
 
     VideoMAEModel model(a.videomae_dir, a.onnx_path, a.use_cuda);
-    std::printf("Inference device: %s\n", model.device().c_str());
-    if (a.use_cuda && model.device() != "cuda") std::printf("  [WARNING] CUDA requested but running on %s\n", model.device().c_str());
+    tprintf("Inference device: %s\n", model.device().c_str());
+    if (a.use_cuda && model.device() != "cuda") tprintf("  [WARNING] CUDA requested but running on %s\n", model.device().c_str());
 
     setenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", a.live.rtsp_tcp ? "rtsp_transport;tcp" : "rtsp_transport;udp", 1);
     std::signal(SIGINT, on_signal);
@@ -914,7 +977,7 @@ int run_live(const Args& a) {
 Args parse_args(int argc, char** argv) {
     Args a;
     auto usage = [&] {
-        std::printf(
+        tprintf(
             "Usage: %s --videomae_dir DIR [--rtsp URL] [--onnx_path FILE] [--udp] [--cpu]\n"
             "  [--window_len S] [--stride S] [--fps F] [--num_frames N] [--min_segment_duration S]\n"
             "  [--confidence_threshold P] [--roi x,y,w,h] [--merge_step6]\n"
@@ -922,6 +985,7 @@ Args parse_args(int argc, char** argv) {
             "                   [--post_no_order] [--post_order a,b,c,...] [--post_debug]\n"
             "  live: [--buffer_sec S] [--status_interval S] [--complete_gap S] [--cycle_max_sec S] [--cycle_idle_sec S]\n"
             "        [--confirm_updates N] [--max_frame_gap S] [--reconnect_sec S] [--max_runtime_sec S] [--events_log FILE.jsonl]\n"
+            "        [--terminal_csv FILE.csv]   (terminal output log, default terminal_output.csv)\n"
             "  (default stream: %s, CUDA on by default)\n",
             argv[0], a.live.rtsp_url.c_str());
     };
@@ -975,6 +1039,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--max_runtime_sec") a.live.max_runtime_sec = std::stod(val());
         else if (k == "--events_log") a.live.events_log = val();
         else if (k == "--confirm_updates") a.live.confirm_updates = std::stoi(val());
+        else if (k == "--terminal_csv") val();   // consumed in main(); default terminal_output.csv
         else { usage(); throw std::runtime_error("unknown argument: " + k); }
     }
     if (a.videomae_dir.empty()) { usage(); throw std::runtime_error("--videomae_dir is required"); }
@@ -986,10 +1051,17 @@ Args parse_args(int argc, char** argv) {
 }  // namespace vmae
 
 int main(int argc, char** argv) {
+    std::string csv_path = "terminal_output.csv";
+    for (int i = 1; i < argc; ++i) {
+        std::string k = argv[i];
+        if (k == "--terminal_csv" && i + 1 < argc) csv_path = argv[i + 1];
+        else if (k.rfind("--terminal_csv=", 0) == 0) csv_path = k.substr(15);
+    }
+    vmae::csv_open(csv_path);
     try {
         return vmae::run_live(vmae::parse_args(argc, argv));
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "error: %s\n", e.what());
+        vmae::tprint(stderr, std::string("error: ") + e.what() + "\n");
         return 1;
     }
 }
