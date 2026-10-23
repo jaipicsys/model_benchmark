@@ -1334,8 +1334,8 @@ static std::vector<RawFrame> read_window_frames(cv::VideoCapture& cap, const Win
 
 // One long recording (hours). Windows are classified exactly like Step 2 (same thresholds, min-duration
 // filter, merge, segment-confidence filter, step-order DP); the footage is cut into cycles on the fly:
-//   * a cycle ends when stop_step2 is detected, passes the segment-confidence check, and is CLOSED
-//     (a later non-stop_step2 segment exists after it) -> cycles_completed += 1, next cycle starts right after it;
+//   * a cycle starts at start_step1 (stacked start_step1 = one) and ends when a new start_step1 follows stop_step1
+//     (stop_step2 only counts as a proper end when stop_step1 precedes it) -> cycles_completed += 1;
 //   * every detected step of the cycle is appended to the CSV with its video timestamp (flushed per cycle).
 // Per-window probabilities are appended to a cache file after every window, so a stopped / killed run resumes
 // where it stopped (cached windows replay instantly; the CSV is simply regenerated).
@@ -1460,40 +1460,76 @@ static int run_long_video(const Args& a, const Collapse& col, const std::vector<
         csv.flush();
         std::fflush(stdout);
     };
+    // ---- cycle segmentation --------------------------------------------------------------------------------
+    //   * a cycle STARTS at start_step1 (back-to-back / stacked start_step1 segments count as one);
+    //   * stop_step2 only counts when the step before it is stop_step1 (otherwise it is a false detection);
+    //   * a cycle ENDS when a new start_step1 follows stop_step1 (stop_step2 segments in between are ignored,
+    //     any other step after stop_step1 means that stop_step1 was a false detection -> cycle goes on);
+    //   * a start_step1 that does NOT follow stop_step1 stays inside the current cycle (restart / false start).
+    static const std::string START = "start_step1", STOP1 = "stop_step1";
+    const size_t NONE = static_cast<size_t>(-1);
+
+    // proper end of a cycle: last detection is stop_step2 AND the one before it is stop_step1
     auto stop_confirmed = [&](const std::vector<Detected>& det) {
-        if (det.empty() || det.back().label != STOP) return false;
+        if (det.size() < 2 || det.back().label != STOP || det[det.size() - 2].label != STOP1) return false;
         if (a.post.enable && a.post.do_conf_filter && det.back().conf.value_or(0.0) < a.post.seg_conf_thr) return false;
         return true;
     };
 
-    size_t cs = 0;  // first window of the current cycle
-    bool seen_stop = false;
+    // Looks inside windows [lo, hi) for the first start_step1 segment that comes after a stop_step1.
+    // Returns the index of the first window of that start_step1 segment (= first window of the next cycle),
+    // or NONE.
+    auto find_next_start = [&](size_t lo, size_t hi) -> size_t {
+        std::vector<double> st, en, cc;
+        std::vector<std::string> lb;
+        for (size_t k = lo; k < hi; ++k) {
+            st.push_back(W[k].start);
+            en.push_back(W[k].end);
+            cc.push_back(cf[k]);
+            lb.push_back(lab[k]);
+        }
+        std::vector<WindowTime> wt(W.begin() + lo, W.begin() + hi);
+        auto segs = apply_min_duration_filter(labels_to_segments(st, en, lb), a.min_segment_duration);
+        bool after_stop1 = false;  // stop_step1 seen, and only stop_step2 segments since
+        for (const auto& s : segs) {
+            if (s.label == UNCERTAIN) continue;
+            if (a.post.enable && a.post.do_conf_filter &&
+                segment_confidence(wt, cc, s).value_or(0.0) < a.post.seg_conf_thr)
+                continue;  // low confidence segment: ignored, same as in the post-processing
+            if (s.label == STOP1) after_stop1 = true;
+            else if (s.label == STOP) continue;  // does not break "previous step is stop_step1"
+            else if (s.label == START) {
+                if (after_stop1) {
+                    for (size_t k = lo; k < hi; ++k)
+                        if (W[k].start >= s.start_sec - 1e-6) return k;
+                }
+            } else after_stop1 = false;  // another step followed stop_step1 -> that stop_step1 was false
+        }
+        return NONE;
+    };
+
+    size_t cs = 0;             // first window of the current cycle
+    bool seen_stop1 = false;   // a window labelled stop_step1 exists in the current cycle
     auto cycle_step = [&](size_t i) {  // called after window i has been labelled
-        if (lab[i] == STOP) seen_stop = true;
-        if (!seen_stop || lab[i] == STOP) return;  // stop_step2 may still be running
+        if (lab[i] == STOP1) seen_stop1 = true;
+        if (!seen_stop1 || lab[i] != START) return;  // a new cycle can only begin on a start_step1 window
+
+        const size_t j = find_next_start(cs, i + 1);
+        if (j == NONE || j <= cs) return;
 
         std::vector<Segment> segs;
-        auto det = analyse(cs, i + 1, segs);
-        if (!stop_confirmed(det)) return;
-        const Detected& d = det.back();
-        // closed: the last segment of the timeline is something else and ends after stop_step2 did
-        if (segs.empty() || segs.back().label == STOP || segs.back().end_sec <= d.end + 1e-6) return;
-
+        auto det = analyse(cs, j, segs);  // the finished cycle = windows [cs, j)
+        const bool proper = stop_confirmed(det);
         ++completed;
-        std::printf("\n  >>> stop_step2 confirmed at %s -> cycle %d completed (cycles_completed=%d)\n", hms(d.end).c_str(),
-                    completed, completed);
-        write_rows(det, completed, "COMPLETE");
+        std::printf("\n  >>> new start_step1 at %s after stop_step1 -> cycle %d closed (%s)\n", hms(W[j].start).c_str(),
+                    completed, proper ? "stop_step2 after stop_step1 found" : "NO proper stop_step2");
+        write_rows(det, completed, proper ? "COMPLETE" : "INCOMPLETE");
         std::printf("\n");
 
-        // next cycle starts at the first window after the last stop_step2 window
-        const double cut = d.end - wlen / 2.0 + 1e-6;
-        size_t nxt = i + 1;
-        for (size_t j = cs; j <= i; ++j)
-            if ((W[j].start + W[j].end) / 2.0 > cut) { nxt = j; break; }
-        cs = nxt;
-        seen_stop = false;
-        for (size_t j = cs; j <= i; ++j)
-            if (lab[j] == STOP) { seen_stop = true; break; }
+        cs = j;  // next cycle starts at the first window of the start_step1 segment
+        seen_stop1 = false;
+        for (size_t k = cs; k <= i; ++k)
+            if (lab[k] == STOP1) { seen_stop1 = true; break; }
     };
 
     // ---- main streaming loop
