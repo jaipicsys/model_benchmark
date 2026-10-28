@@ -38,3 +38,4 @@ __pycache__/
 
 #directories
 jumbled_tests/
+video_mae/data_dir/
