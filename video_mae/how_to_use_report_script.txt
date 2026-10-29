@@ -63,3 +63,12 @@ g++ -std=c++17 -O2 make_test_report_long_video.cpp -o make_test_report_long_vide
 flags: 
 --cpu  = Use cpu instead of GPU
 --no_cache = Run from the beginning of the video.
+
+
+6) How to use make_test_report_long_video.py
+
+
+python3 make_test_report_long_video.py     --videomae_dir runs/roi_v9/videomae_finetuned/best_model     --long_video caa_16hrs_trimmed.mkv     --xlsx_out detections.xlsx     --window_len 6.5 --stride 1.0 --fps 15 --num_frames 16
+
+
+
