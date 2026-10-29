@@ -35,6 +35,8 @@ video_mae/make_test_report_long_video
 # python cache
 __pycache__/
 *.pyc
+video_mae/detections.xlsx.cache.json
+
 
 #directories
 jumbled_tests/

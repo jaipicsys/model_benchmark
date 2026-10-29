@@ -3,7 +3,8 @@
 Runs the VideoMAE temporal test and fills temporal_test_template.xlsx.
 
   Step 1 (individual clips)  : every video in --individual_dir; true label is parsed
-                               from the filename (start_step1_op1_16.mkv -> start_step1).
+                               from the filename (start_step1_op1_16.mkv -> start_step1,
+                               sop_step12_1.mkv -> sop_step12).
                                Default --clip_method any_detected: a clip PASSES if its true label
                                is detected as a segment anywhere in the clip.
   Step 2 (continuous videos) : every cycleN.mkv in --continuous_dir; ground truth is read
@@ -51,16 +52,32 @@ from datetime import datetime
 import numpy as np
 
 UNCERTAIN = "uncertain"
+
+# ============================================================================ EDIT HERE: EXCEL LABEL NAMES
+# LABEL_RENAME maps a normalised name -> the name you want in Excel.
+# It is applied (via canon()) to the model classes, the filename labels AND the GT .ods headers,
+# so all three always end up with the same name.
+# Keys must be the NORMALISED form (what canon() produces before renaming), e.g.
+#     "sop_step12" -> "stop_step1"     (rename sop_step12 to stop_step1)
+#     "step3"      -> "step3_new"
+# Default: empty = no renaming (sop_step12 stays sop_step12).
+LABEL_RENAME = {}
+
 MERGE_STEP6_RENAME = {"step6": "step6.5"}   # only used with --merge_step6 (default: step6 and step6.5 are separate classes)
 GT_MERGE_GAP = 3.0                      # GT ranges with the same label closer than this get merged
 MAX_ROWS = 40                           # template capacity for GT rows and detected rows per sheet
+
+# Order used by the step-order filter. Labels NOT in this list are dropped by the filter.
+# Use the Excel label names (after LABEL_RENAME). sop_step12 added at the end - move it if it belongs elsewhere.
 DEFAULT_ORDER = ["start_step1", "start_step2", "step4", "step5", "step6", "step6.5",
-                 "step7", "step8", "step9", "step10", "stop_step1", "stop_step2"]
+                 "step7", "step8", "step9", "step10", "stop_step1", "stop_step2", "sop_step12"]
 
 
 # ----------------------------------------------------------------------------- labels
-_STEP_RE = re.compile(r"^(?:(start|stop)_)?step_?(\d+(?:\.\d+)?)$", re.I)
-_FILE_RE = re.compile(r"^(?P<lab>(?:(?:start|stop)_)?step_?\d+(?:\.\d+)?)_(?:op\d+_)?\d+$", re.I)
+# Accepts: step3, step_3, start_step1, stop_step2, sop_step12, step6.5 ...
+_STEP_RE = re.compile(r"^(?:(start|stop|sop)_)?step_?(\d+(?:\.\d+)?)$", re.I)
+# Filename stem: <label>_<n>  or  <label>_op<k>_<n>   e.g. sop_step12_1, start_step1_op1_16
+_FILE_RE = re.compile(r"^(?P<lab>(?:(?:start|stop|sop)_)?step_?\d+(?:\.\d+)?)_(?:op\d+_)?\d+$", re.I)
 
 
 def canon(name, rename):
@@ -71,6 +88,8 @@ def canon(name, rename):
         pre, n = m.groups()
         if pre == "stop":
             s = f"stop_step{n}"
+        elif pre == "sop":
+            s = f"sop_step{n}"
         elif n in ("1", "2"):
             s = f"start_step{n}"
         else:
@@ -741,7 +760,9 @@ def main():
     a = parse_args()
     if not a.individual_dir and not a.continuous_dir:
         sys.exit("Give --individual_dir and/or --continuous_dir")
-    rename = dict(MERGE_STEP6_RENAME) if a.merge_step6 else {}
+    rename = dict(LABEL_RENAME)
+    if a.merge_step6:
+        rename.update(MERGE_STEP6_RENAME)
     be = load_backend()
 
     import openpyxl

@@ -52,10 +52,14 @@ g++ -std=c++17 -O2 make_test_reportC_rtsp.cpp -o make_test_reportC_rtsp \
 
 5) How to compile and run make_test_report_long_video.cpp
 
- g++ -std=c++17 -O2 make_test_report_long_video.cpp -o make_test_reportC     $(pkg-config --cflags opencv4)     -I"$ORT/include"     -L"$ORT/lib"     -Wl,-rpath,"$ORT/lib"     $(pkg-config --libs opencv4)     -lonnxruntime -lxlnt -lzip -lpugixml
-
 export ORT="$HOME/work/model_benchmark/video_mae/onnxruntime-linux-x64-gpu-1.19.2"
+
+g++ -std=c++17 -O2 make_test_report_long_video.cpp -o make_test_report_long_video     $(pkg-config --cflags opencv4)     -I"$ORT/include"     -L"$ORT/lib"     -Wl,-rpath,"$ORT/lib"     $(pkg-config --libs opencv4)     -lonnxruntime -lxlnt -lzip -lpugixml
+
 
 
 ./make_test_report_long_video   --videomae_dir runs/roi_v5/videomae_finetuned/best_model/   --long_video caa_16hrs_trimmed.mkv   --csv_out detected_steps.csv   --window_len 6.5 --stride 1.0 --fps 15 --num_frames 16   --min_segment_duration 7.5 --confidence_threshold 0.7
 
+flags: 
+--cpu  = Use cpu instead of GPU
+--no_cache = Run from the beginning of the video.
